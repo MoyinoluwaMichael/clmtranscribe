@@ -1,98 +1,99 @@
 #!/usr/bin/env bash
 set -e
 
-echo "Debug: Current working directory: $(pwd)"
-echo "Debug: Contents of /app: $(ls -la /app)"
-echo "Debug: Contents of /app/whisper.cpp: $(ls -la /app/whisper.cpp)"
+# Memory and performance optimizations
+export OMP_NUM_THREADS=2
+export MALLOC_TRIM_THRESHOLD_=131072
 
 INPUT="$1"
-BASE="$(basename "$INPUT" .mp3)"
+BASE="$(basename "$INPUT" | sed 's/\.[^.]*$//')"
 WAV="/tmp/${BASE}.wav"
 OUT_PREFIX="/tmp/${BASE}"
-MODEL="/app/whisper.cpp/models/ggml-medium.en.bin"
 
-# Try different possible locations for the whisper executable
+# Use smaller, faster model for better memory usage
+MODEL="/app/whisper.cpp/models/ggml-base.en.bin"
+
+# Find whisper executable
 WHISPER_LOCATIONS=(
-    "/app/whisper.cpp/build/bin/whisper-cli"
-    "/app/whisper.cpp/whisper-cli"
-    "/app/whisper.cpp/build/bin/main"
     "/app/whisper.cpp/main"
-    "/app/whisper.cpp/build/main"
+    "/app/whisper.cpp/build/bin/main"
+    "/app/whisper.cpp/whisper-cli"
+    "/app/whisper.cpp/build/bin/whisper-cli"
 )
 
 WHISPER=""
 for location in "${WHISPER_LOCATIONS[@]}"; do
-    echo "Debug: Checking for whisper executable at: $location"
-    if [ -f "$location" ]; then
+    if [ -f "$location" ] && [ -x "$location" ]; then
         WHISPER="$location"
-        echo "Debug: Found whisper executable at: $WHISPER"
         break
     fi
 done
 
 if [ -z "$WHISPER" ]; then
-    echo "Debug: Whisper executable NOT found in any expected location"
-    echo "Debug: Available files in whisper.cpp directory:"
-    find /app/whisper.cpp -name "*main*" -type f 2>/dev/null || echo "No main files found"
-
-    # Try to build whisper if it's not found
-    echo "Debug: Attempting to build whisper..."
-    cd /app/whisper.cpp
-    make clean || true
-    make -j$(nproc)
-
-    # Check again for the executable
-    for location in "${WHISPER_LOCATIONS[@]}"; do
-        if [ -f "$location" ]; then
-            WHISPER="$location"
-            echo "Debug: Built whisper executable found at: $WHISPER"
-            break
-        fi
-    done
-
-    if [ -z "$WHISPER" ]; then
-        echo "Error: Could not find or build whisper executable"
-        exit 1
-    fi
-fi
-
-echo "Debug: Checking if model exists: $MODEL"
-if [ -f "$MODEL" ]; then
-    echo "Debug: Model found"
-else
-    echo "Debug: Model NOT found"
-    echo "Debug: Available model files:"
-    ls -la /app/whisper.cpp/models/ || echo "Models directory not found"
+    echo "Error: Whisper executable not found"
     exit 1
 fi
 
-echo "Converting → $WAV"
-ffmpeg -y -i "$INPUT" -ar 16000 -ac 1 -c:a pcm_s16le "$WAV"
+if [ ! -f "$MODEL" ]; then
+    echo "Error: Model file not found: $MODEL"
+    exit 1
+fi
 
-echo "Running whisper..."
-echo "Debug: Command: $WHISPER -m $MODEL -f $WAV -otxt -of $OUT_PREFIX --print-progress"
+# Convert audio with memory-efficient settings
+echo "Converting audio..."
+ffmpeg -y -i "$INPUT" \
+    -ar 16000 \
+    -ac 1 \
+    -c:a pcm_s16le \
+    -f wav \
+    -loglevel error \
+    "$WAV"
 
-# Add timeout and progress output (no --verbose flag exists)
-timeout 300 "$WHISPER" -m "$MODEL" -f "$WAV" -otxt -of "$OUT_PREFIX" --print-progress || {
+# Check converted file size
+WAV_SIZE=$(stat -c%s "$WAV" 2>/dev/null || echo "0")
+if [ "$WAV_SIZE" -gt $((100 * 1024 * 1024)) ]; then
+    echo "Error: Converted audio file too large"
+    rm -f "$WAV"
+    exit 1
+fi
+
+# Run whisper with memory constraints
+echo "Running transcription..."
+timeout 300 "$WHISPER" \
+    -m "$MODEL" \
+    -f "$WAV" \
+    -otxt \
+    -of "$OUT_PREFIX" \
+    --no-timestamps \
+    --language en \
+    --threads 2 2>/dev/null || {
+
     EXIT_CODE=$?
-    echo "Debug: Whisper command failed with exit code: $EXIT_CODE"
+    rm -f "$WAV"
+
     if [ $EXIT_CODE -eq 124 ]; then
-        echo "Debug: Whisper timed out after 300 seconds"
+        echo "Error: Transcription timed out"
+    else
+        echo "Error: Transcription failed"
     fi
     exit $EXIT_CODE
 }
 
-echo "Done  →  ${OUT_PREFIX}.txt"
+# Clean up WAV file immediately
+rm -f "$WAV"
 
-# Verify the output file was created
-if [ -f "${OUT_PREFIX}.txt" ]; then
-    echo "Debug: Transcript file created successfully"
-    echo "Debug: File size: $(stat -c%s "${OUT_PREFIX}.txt") bytes"
-    echo "Debug: First few lines:"
-    head -3 "${OUT_PREFIX}.txt" || echo "Could not read transcript file"
-else
-    echo "Debug: ERROR - Transcript file was not created"
-    echo "Debug: Contents of /tmp:"
-    ls -la /tmp/ | grep "$BASE" || echo "No files with base name found"
+# Verify output
+if [ ! -f "${OUT_PREFIX}.txt" ]; then
+    echo "Error: Transcript file not created"
     exit 1
 fi
+
+# Check output file size
+OUTPUT_SIZE=$(stat -c%s "${OUT_PREFIX}.txt" 2>/dev/null || echo "0")
+if [ "$OUTPUT_SIZE" -eq 0 ]; then
+    echo "Error: Empty transcript file"
+    rm -f "${OUT_PREFIX}.txt"
+    exit 1
+fi
+
+echo "Transcription completed successfully"

@@ -7,84 +7,177 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
-import java.io.File;
+import java.io.*;
 import java.nio.file.Files;
+import java.util.concurrent.TimeUnit;
 
 @RestController
 @RequestMapping("/api/transcribe")
 public class TranscriptionController {
 
+    private static final long MAX_FILE_SIZE = 25 * 1024 * 1024; // Reduced to 25MB
+    private static final int TIMEOUT_MINUTES = 5;
+
     @PostMapping
     public ResponseEntity<Resource> transcribeAudio(@RequestParam("file") MultipartFile file) {
         File tempFile = null;
         File transcriptFile = null;
+        Process process = null;
 
         try {
-            // Basic validation
-            if (file.getSize() > 100 * 1024 * 1024) {
-                throw new IllegalArgumentException("File is too large. Limit is 100MB.");
+            // Strict validation
+            if (file.getSize() > MAX_FILE_SIZE) {
+                throw new IllegalArgumentException("File too large. Maximum size is 25MB.");
             }
-            if (!file.getContentType().startsWith("audio")) {
-                throw new IllegalArgumentException("Only audio files are allowed.");
+            if (file.isEmpty()) {
+                throw new IllegalArgumentException("File is empty.");
+            }
+            if (!isAudioFile(file.getContentType())) {
+                throw new IllegalArgumentException("Only audio files are supported.");
             }
 
-            // Save the uploaded file to a temporary file
-            tempFile = File.createTempFile("audio-", ".mp3");
-            file.transferTo(tempFile);
+            // Create temporary file with proper extension
+            String originalName = file.getOriginalFilename();
+            String extension = getFileExtension(originalName);
+            tempFile = File.createTempFile("audio-", extension);
 
-            // Define transcript output path
-            String baseName = tempFile.getName().replaceAll("\\.mp3$", "");
+            // Stream file to disk to avoid loading entire file in memory
+            try (InputStream inputStream = file.getInputStream();
+                 FileOutputStream outputStream = new FileOutputStream(tempFile)) {
+                inputStream.transferTo(outputStream);
+            }
+
+            // Define output file
+            String baseName = tempFile.getName().replaceAll("\\.[^.]+$", "");
             transcriptFile = new File("/tmp/" + baseName + ".txt");
 
-            // Build and run the whisper command
-            String[] command = {
+            // Execute whisper with proper process management
+            ProcessBuilder pb = new ProcessBuilder(
                     "/bin/bash",
-                    new File("whisper-wrapper.sh").getAbsolutePath(),
+                    "/app/whisper-wrapper.sh",
                     tempFile.getAbsolutePath()
-            };
+            );
 
-            Process process = Runtime.getRuntime().exec(command);
-            String stdout = new String(process.getInputStream().readAllBytes());
-            String stderr = new String(process.getErrorStream().readAllBytes());
+            // Set working directory and environment
+            pb.directory(new File("/app"));
+            pb.environment().put("TMPDIR", "/tmp");
 
-            int exitCode = process.waitFor();
+            process = pb.start();
+
+            // Handle process streams to prevent hanging
+            StreamGobbler outputGobbler = new StreamGobbler(process.getInputStream());
+            StreamGobbler errorGobbler = new StreamGobbler(process.getErrorStream());
+
+            outputGobbler.start();
+            errorGobbler.start();
+
+            // Wait with timeout
+            boolean finished = process.waitFor(TIMEOUT_MINUTES, TimeUnit.MINUTES);
+
+            if (!finished) {
+                process.destroyForcibly();
+                throw new RuntimeException("Transcription timed out after " + TIMEOUT_MINUTES + " minutes");
+            }
+
+            int exitCode = process.exitValue();
             if (exitCode != 0) {
-                throw new RuntimeException("Whisper failed.\nSTDOUT: " + stdout + "\nSTDERR: " + stderr);
+                String errorOutput = errorGobbler.getOutput();
+                throw new RuntimeException("Whisper failed with exit code " + exitCode + ": " + errorOutput);
             }
 
-            // Check that output file exists
-            if (!transcriptFile.exists()) {
-                throw new RuntimeException("Transcript file was not created: " + transcriptFile.getAbsolutePath());
+            // Verify output exists
+            if (!transcriptFile.exists() || transcriptFile.length() == 0) {
+                throw new RuntimeException("Transcript file was not created or is empty");
             }
 
-            // Read the transcript content into memory
-            byte[] transcriptContent = Files.readAllBytes(transcriptFile.toPath());
+            // Read transcript efficiently
+            byte[] transcriptContent;
+            try {
+                transcriptContent = Files.readAllBytes(transcriptFile.toPath());
+            } catch (OutOfMemoryError e) {
+                throw new RuntimeException("Transcript file too large to process");
+            }
 
-            // Clean up the transcript file immediately after reading
-            transcriptFile.delete();
-
-            // Create a ByteArrayResource with the content
-            Resource resource = new ByteArrayResource(transcriptContent);
-
-            String originalFileName = file.getOriginalFilename();
-            String baseFileName = originalFileName != null
-                    ? originalFileName.replaceFirst("[.][^.]+$", "")
+            // Create response
+            String baseFileName = originalName != null
+                    ? originalName.replaceFirst("\\.[^.]+$", "")
                     : "transcript";
 
             return ResponseEntity.ok()
                     .contentType(MediaType.TEXT_PLAIN)
-                    .body(resource);
+                    .header("Content-Disposition",
+                            "attachment; filename=\"" + baseFileName + "_transcript.txt\"")
+                    .body(new ByteArrayResource(transcriptContent));
 
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Transcription was interrupted", e);
         } catch (Exception e) {
-            return ResponseEntity.internalServerError()
+            return ResponseEntity.badRequest()
                     .contentType(MediaType.TEXT_PLAIN)
-                    .body(new ByteArrayResource(("Transcription failed.\n\n" + e.getMessage()).getBytes()));
+                    .body(new ByteArrayResource(
+                            ("Transcription failed: " + e.getMessage()).getBytes()));
         } finally {
-            // Always delete the temporary input file
-            if (tempFile != null && tempFile.exists()) {
-                tempFile.delete();
+            // Cleanup resources
+            cleanup(tempFile, transcriptFile, process);
+
+            // Suggest garbage collection
+            System.gc();
+        }
+    }
+
+    private boolean isAudioFile(String contentType) {
+        return contentType != null && (
+                contentType.startsWith("audio/") ||
+                        contentType.equals("application/ogg") ||
+                        contentType.equals("video/mp4") // Some audio files are detected as video/mp4
+        );
+    }
+
+    private String getFileExtension(String filename) {
+        if (filename == null) return ".mp3";
+        int lastDot = filename.lastIndexOf('.');
+        return lastDot > 0 ? filename.substring(lastDot) : ".mp3";
+    }
+
+    private void cleanup(File tempFile, File transcriptFile, Process process) {
+        if (process != null && process.isAlive()) {
+            process.destroyForcibly();
+        }
+
+        if (tempFile != null && tempFile.exists()) {
+            tempFile.delete();
+        }
+
+        if (transcriptFile != null && transcriptFile.exists()) {
+            transcriptFile.delete();
+        }
+    }
+
+    // Helper class to handle process streams
+    private static class StreamGobbler extends Thread {
+        private final InputStream inputStream;
+        private final StringBuilder output = new StringBuilder();
+
+        StreamGobbler(InputStream inputStream) {
+            this.inputStream = inputStream;
+        }
+
+        @Override
+        public void run() {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    output.append(line).append("\n");
+                }
+            } catch (IOException e) {
+                // Log error but don't throw
+                System.err.println("Error reading process output: " + e.getMessage());
             }
-            // Note: transcriptFile is already deleted after reading
+        }
+
+        String getOutput() {
+            return output.toString();
         }
     }
 }
