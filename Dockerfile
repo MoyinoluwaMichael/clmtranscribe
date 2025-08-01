@@ -1,30 +1,41 @@
-FROM ubuntu:22.04
+FROM eclipse-temurin:17-jdk
 
-# Install dependencies
+# Install ffmpeg, dos2unix, and build tools
 RUN apt-get update && apt-get install -y \
-    git cmake build-essential ffmpeg curl openjdk-17-jdk maven unzip
+    ffmpeg \
+    git \
+    build-essential \
+    cmake \
+    curl \
+    dos2unix \
+    && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
+# Set workdir
 WORKDIR /app
 
-# Clone and build whisper.cpp
+# Copy all source files including wrapper script
+COPY . /app
+
+# Clone whisper.cpp and build it
 RUN git clone https://github.com/ggerganov/whisper.cpp.git && \
-    cd whisper.cpp && make
+    cd whisper.cpp && \
+    make -j$(nproc) && \
+    echo "Build completed, listing build directory:" && \
+    ls -la /app/whisper.cpp/build/bin/ || echo "build/bin directory not found" && \
+    ls -la /app/whisper.cpp/ | grep -E "(main|whisper)" || echo "No whisper executables found in root"
 
-# Download Whisper model
-RUN curl -L -o whisper.cpp/models/ggml-medium.en.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin
+# Download the medium English model
+RUN cd whisper.cpp && \
+    bash ./models/download-ggml-model.sh medium.en && \
+    ls -la models/
 
-# Copy your Spring Boot app code into the container
-COPY . .
+# Convert whisper-wrapper.sh line endings and grant execute permission
+RUN dos2unix /app/whisper-wrapper.sh && \
+    chmod +x /app/whisper-wrapper.sh && \
+    sed -i '1s|.*|#!/bin/bash|' /app/whisper-wrapper.sh
 
-# Make your wrapper script executable
-RUN chmod +x /app/whisper-wrapper.sh
+# Package Java project
+RUN ./mvnw package -DskipTests
 
-# Build the Spring Boot app
-RUN mvn clean package -DskipTests
-
-# Expose port
-EXPOSE 8080
-
-# Run the application
+# Set entry point
 ENTRYPOINT ["java", "-jar", "target/clmtranscribe-0.0.1-SNAPSHOT.jar"]
