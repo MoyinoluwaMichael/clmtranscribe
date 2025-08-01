@@ -4,25 +4,27 @@ FROM ubuntu:22.04
 RUN apt-get update && apt-get install -y \
     git cmake build-essential ffmpeg curl openjdk-17-jdk maven unzip
 
-# Set up working directory
+# Set working directory
 WORKDIR /app
 
 # Clone and build whisper.cpp
 RUN git clone https://github.com/ggerganov/whisper.cpp.git && \
     cd whisper.cpp && make
 
-# Download model
+# Download Whisper model
 RUN curl -L -o whisper.cpp/models/ggml-medium.en.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin
 
-# Copy Spring Boot app
-COPY . /app
+# Copy your Spring Boot app code into the container
+COPY . .
 
-# Make wrapper executable
+# Make your wrapper script executable
 RUN chmod +x /app/whisper-wrapper.sh
 
-# Build Spring Boot app
+# Build the Spring Boot app
 RUN mvn clean package -DskipTests
 
+# Expose port
 EXPOSE 8080
 
-CMD ["java", "-jar", "target/your-app-name.jar"]
+# Run the application
+ENTRYPOINT ["java", "-jar", "target/clmtranscribe-0.0.1-SNAPSHOT.jar"]
