@@ -1,47 +1,41 @@
-# Use a more memory-efficient base image
-FROM eclipse-temurin:17-jre-alpine
+FROM eclipse-temurin:17-jdk
 
-# Install required packages
-RUN apk add --no-cache \
+# Install ffmpeg, dos2unix, and build tools
+RUN apt-get update && apt-get install -y \
     ffmpeg \
     git \
-    build-base \
+    build-essential \
     cmake \
-    bash \
-    dos2unix
+    curl \
+    dos2unix \
+    && rm -rf /var/lib/apt/lists/*
 
 # Set workdir
 WORKDIR /app
 
-# Copy source files
+# Copy all source files including wrapper script
 COPY . /app
 
-# Clone and build whisper.cpp with optimizations
+# Clone whisper.cpp and build it
 RUN git clone https://github.com/ggerganov/whisper.cpp.git && \
     cd whisper.cpp && \
-    # Build with optimizations and smaller memory footprint
-    make -j$(nproc) WHISPER_NO_AVX=1 WHISPER_NO_AVX2=1 && \
-    # Clean up build artifacts to save space
-    make clean && \
-    # Remove git history to save space
-    rm -rf .git
+    make -j$(nproc) && \
+    echo "Build completed, listing build directory:" && \
+    ls -la /app/whisper.cpp/build/bin/ || echo "build/bin directory not found" && \
+    ls -la /app/whisper.cpp/ | grep -E "(main|whisper)" || echo "No whisper executables found in root"
 
-# Download smaller model for better memory usage
+# Download the medium English model
 RUN cd whisper.cpp && \
-    bash ./models/download-ggml-model.sh base.en && \
-    # Remove other model files if they exist
-    find models/ -name "*.bin" ! -name "*base.en*" -delete 2>/dev/null || true
+    bash ./models/download-ggml-model.sh medium.en && \
+    ls -la models/
 
-# Fix script permissions
+# Convert whisper-wrapper.sh line endings and grant execute permission
 RUN dos2unix /app/whisper-wrapper.sh && \
-    chmod +x /app/whisper-wrapper.sh
+    chmod +x /app/whisper-wrapper.sh && \
+    sed -i '1s|.*|#!/bin/bash|' /app/whisper-wrapper.sh
 
-# Build Java application
-RUN ./mvnw package -DskipTests && \
-    # Remove Maven wrapper and source files to save space
-    rm -rf .mvn mvnw mvnw.cmd src target/maven-* target/classes/com target/test-classes 2>/dev/null || true
+# Package Java project
+RUN ./mvnw package -DskipTests
 
-# Set JVM memory limits and garbage collection options
-ENV JAVA_OPTS="-Xms128m -Xmx512m -XX:+UseG1GC -XX:MaxGCPauseMillis=100 -XX:+UseStringDeduplication"
-
-ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar target/clmtranscribe-0.0.1-SNAPSHOT.jar"]
+# Set entry point
+ENTRYPOINT ["java", "-jar", "target/clmtranscribe-0.0.1-SNAPSHOT.jar"]
